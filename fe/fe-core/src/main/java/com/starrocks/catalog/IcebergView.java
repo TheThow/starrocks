@@ -16,6 +16,9 @@ package com.starrocks.catalog;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
+import com.starrocks.connector.parser.spark.SparkParserUtils;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.TableRelation;
 
 import java.util.List;
@@ -26,16 +29,43 @@ public class IcebergView extends ConnectorView {
     private final String defaultDbName;
     private final String location;
     private final Map<String, String> properties;
+    // Dialect of the SQL representation in the definition.
+    private final String dialect;
     public static final String STARROCKS_DIALECT = "starrocks";
+    public static final String SPARK_DIALECT = "spark";
 
     public IcebergView(long id, String catalogName, String dbName, String name, List<Column> schema,
                        String definition, String defaultCatalogName, String defaultDbName,
                        String location, Map<String, String> properties) {
+        this(id, catalogName, dbName, name, schema, definition, defaultCatalogName, defaultDbName, location,
+                properties, STARROCKS_DIALECT);
+    }
+
+    public IcebergView(long id, String catalogName, String dbName, String name, List<Column> schema,
+                       String definition, String defaultCatalogName, String defaultDbName,
+                       String location, Map<String, String> properties, String dialect) {
         super(id, catalogName, dbName, name, schema, definition, TableType.ICEBERG_VIEW);
         this.defaultCatalogName = defaultCatalogName;
         this.defaultDbName = defaultDbName;
         this.location = location;
         this.properties = properties != null ? properties : Maps.newHashMap();
+        this.dialect = dialect;
+    }
+
+    public boolean isSparkDialect() {
+        return SPARK_DIALECT.equalsIgnoreCase(dialect);
+    }
+
+    public String getDefaultDbName() {
+        return defaultDbName;
+    }
+
+    @Override
+    protected QueryStatement doGetQueryStatement(SessionVariable sessionVariable) {
+        if (isSparkDialect()) {
+            return SparkParserUtils.parseView(catalogName, dbName, name, sessionVariable);
+        }
+        return super.doGetQueryStatement(sessionVariable);
     }
 
     @Override

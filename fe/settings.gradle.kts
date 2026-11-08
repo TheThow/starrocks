@@ -21,6 +21,7 @@ include(
     "fe-spi",
     "fe-utils",
     "fe-testing",
+    "fe-spark-dialect",
     "plugin:spark-dpp",
     "plugin:hive-udf",
     "fe-core",

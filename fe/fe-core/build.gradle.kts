@@ -53,6 +53,7 @@ dependencies {
     implementation(project(":fe-spi"))
     implementation(project(":fe-testing"))
     implementation(project(":fe-utils"))
+    implementation(project(":fe-spark-dialect"))
     implementation(project(":plugin:hive-udf"))
     implementation(project(":plugin:spark-dpp"))
 

@@ -15,6 +15,8 @@
 package com.starrocks.qe;
 
 import com.starrocks.catalog.Column;
+import com.starrocks.connector.parser.spark.SparkParserUtils;
+import com.starrocks.spark.dialect.SparkStatementSplitter;
 import com.starrocks.sql.analyzer.AstToSQLBuilder;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.translate.TranslateStmt;
@@ -32,6 +34,14 @@ public class TranslateExecutor {
         String dialect = stmt.getDialect();
         String translateSQL = stmt.getTranslateSQL();
         SessionVariable sessionVariable = ConnectContext.getSessionVariableOrDefault();
+        if (dialect.equalsIgnoreCase("spark")) {
+            // Show the translator's own output: it is the exact SQL StarRocks runs for the Spark statement.
+            List<List<String>> resultRows = new ArrayList<>();
+            for (String sparkSql : SparkStatementSplitter.split(translateSQL)) {
+                resultRows.add(List.of(SparkParserUtils.translate(sparkSql, sessionVariable).sql()));
+            }
+            return new ShowResultSet(COLUMN_META, resultRows);
+        }
         sessionVariable.setSqlDialect(dialect);
         List<StatementBase> statementBases = SqlParser.parse(translateSQL, sessionVariable);
 

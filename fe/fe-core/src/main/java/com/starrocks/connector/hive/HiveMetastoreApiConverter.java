@@ -313,6 +313,13 @@ public class HiveMetastoreApiConverter {
             hiveView = new HiveView(ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asLong(), catalogName,
                     table.getDbName(), table.getTableName(), toFullSchemasForTrinoView(table, trinoViewDefinition),
                     hiveViewText, HiveView.Type.Trino);
+        } else if (table.getParameters() != null && table.getParameters().containsKey(HiveView.SPARK_CREATE_VERSION)) {
+            // A Spark view: its text is Spark SQL, and Spark's analyzer resolves it at query time, with the
+            // SQL configs and namespace stored in the parameters. Parsing it here as StarRocks SQL would only
+            // validate it against the wrong dialect, so skip the eager check below.
+            return new HiveView(ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asLong(), catalogName,
+                    table.getDbName(), table.getTableName(), toFullSchemasForHiveTable(table),
+                    table.getViewExpandedText(), HiveView.Type.Spark, new HashMap<>(table.getParameters()));
         } else {
             hiveView = new HiveView(ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asLong(), catalogName,
                     table.getDbName(), table.getTableName(), toFullSchemasForHiveTable(table),

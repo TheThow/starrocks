@@ -1034,6 +1034,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     // Is Trino dialect downgraded to Starrocks
     public static final String ENABLE_DIALECT_DOWNGRADE = "enable_dialect_downgrade";
 
+    // Spark SQL settings for sql_dialect = 'spark', as "key=value;key=value", e.g. "spark.sql.ansi.enabled=true"
+    public static final String SPARK_SQL_CONF = "spark_sql_conf";
+
     public static final String ENABLE_OUTER_JOIN_REORDER = "enable_outer_join_reorder";
 
     public static final String CBO_REORDER_THRESHOLD_USE_EXHAUSTIVE = "cbo_reorder_threshold_use_exhaustive";
@@ -3295,6 +3298,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VarAttr(name = ENABLE_DIALECT_DOWNGRADE)
     private boolean enableDialectDowngrade = true;
+
+    @VarAttr(name = SPARK_SQL_CONF)
+    private String sparkSqlConf = "";
 
     @VarAttr(name = ENABLE_OUTER_JOIN_REORDER)
     private boolean enableOuterJoinReorder = true;
@@ -6134,6 +6140,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public void setEnableDialectDowngrade(boolean enableDialectDowngrade) {
         this.enableDialectDowngrade = enableDialectDowngrade;
+    }
+
+    public String getSparkSqlConf() {
+        return sparkSqlConf;
+    }
+
+    public void setSparkSqlConf(String sparkSqlConf) {
+        this.sparkSqlConf = sparkSqlConf;
     }
 
     public boolean isEnableOuterJoinReorder() {

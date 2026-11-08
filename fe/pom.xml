@@ -35,6 +35,7 @@ under the License.
         <module>fe-spi</module>
         <module>fe-utils</module>
         <module>fe-testing</module>
+        <module>fe-spark-dialect</module>
         <module>plugin/spark-dpp</module>
         <module>plugin/hive-udf</module>
         <module>fe-core</module>
@@ -228,6 +229,11 @@ under the License.
             <dependency>
                 <groupId>com.starrocks</groupId>
                 <artifactId>fe-utils</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.starrocks</groupId>
+                <artifactId>fe-spark-dialect</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

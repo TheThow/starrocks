@@ -911,8 +911,11 @@ public class IcebergApiConverter {
         String defaultDbName = currentVersion.defaultNamespace().level(0);
         String viewName = icebergView.name();
         String location = icebergView.location();
+        // sqlFor falls back to another dialect when the view has no StarRocks representation; remember which one,
+        // so a Spark representation is resolved with Spark semantics instead of being parsed as StarRocks SQL.
         IcebergView view = new IcebergView(CONNECTOR_ID_GENERATOR.getNextId().asLong(), catalogName, dbName, viewName,
-                columns, sqlView.sql(), defaultCatalogName, defaultDbName, location, icebergView.properties());
+                columns, sqlView.sql(), defaultCatalogName, defaultDbName, location, icebergView.properties(),
+                sqlView.dialect());
         view.setComment(comment);
         return view;
     }

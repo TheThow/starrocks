@@ -19,12 +19,16 @@ import com.google.common.collect.Sets;
 import com.starrocks.catalog.Column;
 import com.starrocks.common.Config;
 import com.starrocks.common.Pair;
+import com.starrocks.connector.parser.spark.SparkParserUtils;
 import com.starrocks.connector.parser.trino.TrinoParserUtils;
 import com.starrocks.connector.trino.TrinoParserUnsupportedException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.GlobalVariable;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.spark.dialect.SparkDialectException;
+import com.starrocks.spark.dialect.SparkStatementSplitter;
+import com.starrocks.spark.dialect.SparkUnsupportedStatementException;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.analyzer.TypeDefAnalyzer;
 import com.starrocks.sql.ast.ImportColumnsStmt;
@@ -81,6 +85,8 @@ public class SqlParser {
         try {
             if (sessionVariable.getSqlDialect().equalsIgnoreCase("trino")) {
                 return parseWithTrinoDialect(sql, sessionVariable);
+            } else if (sessionVariable.getSqlDialect().equalsIgnoreCase("spark")) {
+                return parseWithSparkDialect(sql, sessionVariable);
             } else {
                 return parseWithStarRocksDialect(sql, sessionVariable);
             }
@@ -132,6 +138,39 @@ public class SqlParser {
             throw e;
         }
         if (statements.isEmpty() || statements.stream().anyMatch(Objects::isNull)) {
+            return parseWithStarRocksDialect(sql, sessionVariable);
+        }
+        return statements;
+    }
+
+    /**
+     * Spark SQL is analyzed by Spark and translated into StarRocks SQL with Spark's semantics, which is then parsed
+     * as StarRocks SQL. Statements outside the dialect (SET, USE, SHOW, ...) and text Spark cannot parse go to the
+     * StarRocks parser if enable_dialect_downgrade is set. A statement Spark understands but that cannot be
+     * translated faithfully fails instead: running it as StarRocks SQL would change its meaning.
+     */
+    private static List<StatementBase> parseWithSparkDialect(String sql, SessionVariable sessionVariable) {
+        List<StatementBase> statements = Lists.newArrayList();
+        List<String> sparkStatements = SparkStatementSplitter.split(sql);
+        for (int idx = 0; idx < sparkStatements.size(); ++idx) {
+            String sparkSql = sparkStatements.get(idx);
+            StatementBase statement;
+            try {
+                String translated = SparkParserUtils.translate(sparkSql, sessionVariable).sql();
+                statement = parseWithStarRocksDialect(translated, sessionVariable).get(0);
+            } catch (SparkUnsupportedStatementException e) {
+                if (!sessionVariable.isEnableDialectDowngrade()) {
+                    throw new ParsingException(e.getMessage());
+                }
+                statement = parseWithStarRocksDialect(sparkSql, sessionVariable).get(0);
+            } catch (SparkDialectException e) {
+                LOG.warn("Spark SQL [{}] cannot be translated: {}", sparkSql, e.getMessage());
+                throw new StarRocksPlannerException(ErrorType.USER_ERROR, e.getMessage());
+            }
+            statement.setOrigStmt(new OriginStatement(sql, idx));
+            statements.add(statement);
+        }
+        if (statements.isEmpty()) {
             return parseWithStarRocksDialect(sql, sessionVariable);
         }
         return statements;
