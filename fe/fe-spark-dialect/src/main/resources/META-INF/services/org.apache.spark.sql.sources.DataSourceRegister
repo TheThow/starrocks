@@ -1,0 +1,2 @@
+com.starrocks.spark.dialect.TableFormatProviders$Iceberg
+com.starrocks.spark.dialect.TableFormatProviders$Paimon

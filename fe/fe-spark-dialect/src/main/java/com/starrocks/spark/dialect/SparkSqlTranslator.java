@@ -18,6 +18,7 @@ import org.apache.spark.sql.AnalysisException;
 import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.catalyst.analysis.EliminateSubqueryAliases$;
 import org.apache.spark.sql.catalyst.analysis.ResolvedIdentifier;
+import org.apache.spark.sql.catalyst.analysis.UnresolvedIdentifier;
 import org.apache.spark.sql.catalyst.catalog.CatalogStorageFormat;
 import org.apache.spark.sql.catalyst.catalog.CatalogTable;
 import org.apache.spark.sql.catalyst.catalog.HiveTableRelation;
@@ -74,8 +75,11 @@ import java.util.StringJoiner;
  * <ul>
  *   <li>{@code spark_catalog} backed by a Hive catalog: Spark's Hive rules (storage defaults, partition columns
  *       last).</li>
- *   <li>Iceberg catalogs (as {@code spark_catalog} or under their own name): Iceberg partition transforms,
- *       columns in query order for v2 catalogs.</li>
+ *   <li>Hive catalogs under another name: the same Hive rules, as if that catalog were spark_catalog.</li>
+ *   <li>Iceberg and Paimon catalogs (as {@code spark_catalog} or under their own name): partition transforms
+ *       (Iceberg) or columns (Paimon), columns in query order for v2 catalogs. StarRocks cannot write Paimon, so
+ *       only CREATE TABLE without AS SELECT works there.</li>
+ *   <li>Unified catalogs: the format USING names (iceberg, paimon), a Hive table otherwise.</li>
  *   <li>The StarRocks internal catalog: column names and types are Spark's, storage is StarRocks' default. Spark
  *       storage clauses (USING, STORED AS, PARTITIONED BY, LOCATION, OPTIONS) are rejected, not dropped.</li>
  * </ul>
@@ -91,7 +95,12 @@ public final class SparkSqlTranslator {
     private static final String PARTITION_OVERWRITE_MODE = "spark.sql.sources.partitionOverwriteMode";
     private static final String HIVE = "hive";
     private static final String ICEBERG = "iceberg";
+    private static final String SESSION_CATALOG_NAME = SparkCatalogs.SESSION_CATALOG;
+    private static final String PAIMON = "paimon";
+    private static final String UNIFIED = "unified";
     private static final String INTERNAL = "internal";
+    // USING values that make a Hive table.
+    private static final Set<String> HIVE_PROVIDERS = Set.of(HIVE, "parquet", "orc", "avro");
 
     private final SparkCatalogs catalogs;
     private final SessionlessAnalyzer analyzer;
@@ -141,9 +150,13 @@ public final class SparkSqlTranslator {
 
     private Translation translateParsed(LogicalPlan parsed) {
         checkSupported(parsed);
-        LogicalPlan analyzed;
+        LogicalPlan analyzed = analyze(analyzer, parsed);
+        return analyzer.withConf(() -> render(parsed, analyzed));
+    }
+
+    private static LogicalPlan analyze(SessionlessAnalyzer analyzer, LogicalPlan plan) {
         try {
-            analyzed = analyzer.analyze(parsed);
+            return analyzer.analyze(plan);
         } catch (Exception e) {
             // AnalysisException is checked but undeclared by Scala.
             if (e instanceof AnalysisException) {
@@ -151,7 +164,6 @@ public final class SparkSqlTranslator {
             }
             throw e;
         }
-        return analyzer.withConf(() -> render(parsed, analyzed));
     }
 
     private static void checkSupported(LogicalPlan parsed) {
@@ -176,13 +188,13 @@ public final class SparkSqlTranslator {
     private Translation render(LogicalPlan parsed, LogicalPlan analyzed) {
         PlanRenderer renderer = newRenderer();
         if (analyzed instanceof CreateTable create) {
-            return createSessionCatalogTable(create, StorageClauses.of(parsed), renderer);
+            return createSessionCatalogTable(create, catalogs.sessionCatalog(), StorageClauses.of(parsed), renderer);
         } else if (analyzed instanceof CreateTableAsSelect ctas) {
-            return createCatalogTable(ctas.name(), Scala.list(ctas.partitioning()), ctas.tableSpec(), null,
-                    ctas.query(), ctas.ignoreIfExists(), StorageClauses.of(parsed), renderer);
+            return createCatalogTable(parsed, ctas.name(), Scala.list(ctas.partitioning()), ctas.tableSpec(), null,
+                    ctas.query(), ctas.ignoreIfExists(), renderer);
         } else if (analyzed instanceof org.apache.spark.sql.catalyst.plans.logical.CreateTable create) {
-            return createCatalogTable(create.name(), Scala.list(create.partitioning()), create.tableSpec(),
-                    create.tableSchema(), null, create.ignoreIfExists(), StorageClauses.of(parsed), renderer);
+            return createCatalogTable(parsed, create.name(), Scala.list(create.partitioning()), create.tableSpec(),
+                    create.tableSchema(), null, create.ignoreIfExists(), renderer);
         } else if (analyzed instanceof InsertIntoStatement insert) {
             return insert(insert, renderer);
         } else if (analyzed instanceof AppendData append) {
@@ -202,7 +214,7 @@ public final class SparkSqlTranslator {
     // ---------------------------------------------------------------- DDL
 
     /** Storage clauses the user wrote, from the parsed statement (the analyzed one has Spark's defaults filled in). */
-    private record StorageClauses(List<String> present) {
+    private record StorageClauses(List<String> present, String provider) {
         static StorageClauses of(LogicalPlan parsed) {
             TableSpecBase spec;
             int partitions;
@@ -213,12 +225,14 @@ public final class SparkSqlTranslator {
                 spec = create.tableSpec();
                 partitions = create.partitioning().size();
             } else {
-                return new StorageClauses(List.of());
+                return new StorageClauses(List.of(), null);
             }
             List<String> present = new ArrayList<>();
+            String provider = null;
             if (spec instanceof UnresolvedTableSpec unresolved) {
                 if (unresolved.provider().isDefined()) {
                     present.add("USING");
+                    provider = unresolved.provider().get().toLowerCase(Locale.ROOT);
                 }
                 if (unresolved.serde().isDefined()) {
                     present.add("STORED AS / ROW FORMAT");
@@ -236,12 +250,67 @@ public final class SparkSqlTranslator {
             if (partitions > 0) {
                 present.add("PARTITIONED BY");
             }
-            return new StorageClauses(present);
+            return new StorageClauses(present, provider);
         }
     }
 
-    /** CREATE TABLE in spark_catalog, which ResolveSessionCatalog turned into Spark's v1 CreateTable. */
-    private Translation createSessionCatalogTable(CreateTable create, StorageClauses clauses, PlanRenderer renderer) {
+    /** The kind of table a CREATE TABLE makes. */
+    private enum Format {
+        HIVE, ICEBERG, PAIMON, NATIVE;
+
+        /** ENGINE of a unified catalog's CREATE TABLE. */
+        String engine() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+    }
+
+    /**
+     * The table format CREATE TABLE makes in a StarRocks catalog, for the provider written in USING (or null).
+     * Only catalogs StarRocks can create tables in qualify. A unified catalog creates the format USING names,
+     * and a Hive table without USING.
+     */
+    private static Format format(SparkCatalogBridge bridge, String provider) {
+        switch (bridge.catalogType()) {
+            case INTERNAL:
+                return Format.NATIVE;
+            case HIVE:
+                return requireProvider(Format.HIVE, provider, bridge);
+            case ICEBERG:
+                return requireProvider(Format.ICEBERG, provider, bridge);
+            case PAIMON:
+                return requireProvider(Format.PAIMON, provider, bridge);
+            case UNIFIED:
+                if (ICEBERG.equals(provider)) {
+                    return Format.ICEBERG;
+                } else if (PAIMON.equals(provider)) {
+                    return Format.PAIMON;
+                } else if (provider == null || HIVE_PROVIDERS.contains(provider)) {
+                    return Format.HIVE;
+                }
+                throw new SparkDialectException("USING " + provider + " is not supported in unified catalogs");
+            default:
+                throw new SparkDialectException("StarRocks cannot create tables in " + bridge.catalogType()
+                        + " catalog " + bridge.catalogName());
+        }
+    }
+
+    /** A single-format catalog only accepts USING values of its own format. */
+    private static Format requireProvider(Format format, String provider, SparkCatalogBridge bridge) {
+        boolean matches = provider == null
+                || (format == Format.HIVE ? HIVE_PROVIDERS.contains(provider) : format.engine().equals(provider));
+        if (!matches) {
+            throw new SparkDialectException("USING " + provider + " is not supported in " + bridge.catalogType()
+                    + " catalog " + bridge.catalogName());
+        }
+        return format;
+    }
+
+    /**
+     * CREATE TABLE in spark_catalog, which ResolveSessionCatalog turned into Spark's v1 CreateTable, so Spark's
+     * Hive rules already ran: storage defaults are filled in and partition columns are last.
+     */
+    private Translation createSessionCatalogTable(CreateTable create, SparkCatalogBridge bridge,
+                                                  StorageClauses clauses, PlanRenderer renderer) {
         CatalogTable table = create.tableDesc();
         if (create.mode() == SaveMode.Append || create.mode() == SaveMode.Overwrite) {
             throw new SparkDialectException("CREATE TABLE with save mode " + create.mode() + " is not supported");
@@ -249,99 +318,160 @@ public final class SparkSqlTranslator {
         if (table.bucketSpec().isDefined()) {
             throw new SparkDialectException("CLUSTERED BY / bucketed tables are not supported");
         }
-        SparkCatalogBridge bridge = catalogs.sessionCatalog();
         String db = Scala.orNull(table.identifier().database());
         String name = PlanRenderer.qualifiedName(bridge.catalogName(), db != null ? db : catalogs.currentDatabase(),
                 table.identifier().table());
         boolean ifNotExists = create.mode() == SaveMode.Ignore;
-        Option<LogicalPlan> query = create.query();
-        StructType schema = query.isEmpty() ? table.schema() : null;
+        LogicalPlan query = Scala.orNull(create.query());
+        StructType schema = query == null ? table.schema() : null;
         String comment = Scala.orNull(table.comment());
         Map<String, String> userProperties = Scala.javaMap(table.properties());
+        Format format = format(bridge, clauses.provider());
+        String engine = UNIFIED.equals(bridge.catalogType()) ? format.engine() : null;
+        List<String> partitions = new ArrayList<>();
+        Scala.list(table.partitionColumnNames()).forEach(column -> partitions.add(Sql.quote(column)));
 
-        switch (bridge.catalogType()) {
-            case INTERNAL:
-                return nativeTable(name, ifNotExists, schema, Scala.orNull(query), comment, userProperties, clauses,
-                        renderer);
-            case HIVE: {
-                Map<String, String> properties = new LinkedHashMap<>();
+        Map<String, String> properties = new LinkedHashMap<>();
+        switch (format) {
+            case NATIVE:
+                return nativeTable(name, ifNotExists, schema, query, comment, userProperties, clauses, renderer);
+            case HIVE:
                 // StarRocks defaults Hive tables to Parquet; Spark defaults to Hive's text format, so always say which.
                 properties.put("file_format", hiveFileFormat(table));
                 putLocation(properties, table.storage());
-                properties.putAll(userProperties);
-                List<String> partitions = new ArrayList<>();
-                Scala.list(table.partitionColumnNames()).forEach(column -> partitions.add(Sql.quote(column)));
-                return ddl(name, ifNotExists, schema, Scala.orNull(query), comment, partitions, properties,
-                        renderer);
-            }
-            case ICEBERG: {
-                String provider = Scala.orNull(table.provider());
-                if (!clauses.present().contains("USING") || !ICEBERG.equalsIgnoreCase(provider)) {
-                    // Without USING iceberg, Spark's session catalog would create a Hive table.
-                    throw new SparkDialectException("CREATE TABLE in an Iceberg catalog used as spark_catalog needs "
-                            + "USING iceberg");
+                break;
+            case ICEBERG:
+            case PAIMON:
+                if (clauses.provider() == null) {
+                    // Without USING, Spark's session catalog creates a Hive table, which this catalog cannot hold.
+                    throw new SparkDialectException("CREATE TABLE in " + bridge.catalogType() + " catalog "
+                            + bridge.catalogName() + " used as spark_catalog needs USING " + format.engine());
                 }
-                Map<String, String> properties = new LinkedHashMap<>();
+                checkWritable(format, query);
+                if (format == Format.PAIMON && table.storage().locationUri().isDefined()) {
+                    throw new SparkDialectException("LOCATION is not supported for Paimon tables");
+                }
                 putLocation(properties, table.storage());
-                properties.putAll(userProperties);
-                List<String> partitions = new ArrayList<>();
-                Scala.list(table.partitionColumnNames()).forEach(column -> partitions.add(Sql.quote(column)));
-                return ddl(name, ifNotExists, schema, Scala.orNull(query), comment, partitions, properties,
-                        renderer);
-            }
+                break;
             default:
-                throw new SparkDialectException("CREATE TABLE is not supported in " + bridge.catalogType()
-                        + " catalogs");
+                throw new IllegalStateException(format.name());
         }
+        properties.putAll(userProperties);
+        return ddl(name, ifNotExists, schema, query, comment, engine, partitions, properties, renderer);
     }
 
-    /** CREATE TABLE in a catalog other than spark_catalog: Spark's v2 DDL. */
-    private Translation createCatalogTable(LogicalPlan target, List<Transform> partitioning, TableSpecBase specBase,
-                                           StructType schema, LogicalPlan query, boolean ifNotExists,
-                                           StorageClauses clauses, PlanRenderer renderer) {
+    /**
+     * Spark's v2 CREATE TABLE: in a catalog other than spark_catalog, or in spark_catalog with a v2 provider
+     * (USING iceberg / paimon, see {@link TableFormatProviders}).
+     */
+    private Translation createCatalogTable(LogicalPlan parsed, LogicalPlan target, List<Transform> partitioning,
+                                           TableSpecBase specBase, StructType schema, LogicalPlan query,
+                                           boolean ifNotExists, PlanRenderer renderer) {
         ResolvedIdentifier identifier = (ResolvedIdentifier) target;
-        if (!(identifier.catalog() instanceof BridgeTableCatalog tables)) {
+        SparkCatalogBridge bridge;
+        if (identifier.catalog() instanceof BridgeTableCatalog tables) {
+            bridge = tables.bridge();
+        } else if (SESSION_CATALOG_NAME.equalsIgnoreCase(identifier.catalog().name())) {
+            bridge = catalogs.sessionCatalog();
+        } else {
             throw new SparkDialectException("Spark catalog " + identifier.catalog().name()
                     + " is not backed by StarRocks");
         }
-        SparkCatalogBridge bridge = tables.bridge();
         Identifier ident = identifier.identifier();
         if (ident.namespace().length != 1) {
             throw new SparkDialectException("Table names need exactly one database: " + ident);
         }
         String name = PlanRenderer.qualifiedName(bridge.catalogName(), ident.namespace()[0], ident.name());
         TableSpec spec = (TableSpec) specBase;
+        String provider = Scala.orNull(spec.provider());
+        Format format = format(bridge, provider == null ? null : provider.toLowerCase(Locale.ROOT));
+        String engine = UNIFIED.equals(bridge.catalogType()) ? format.engine() : null;
         String comment = Scala.orNull(spec.comment());
-        Map<String, String> userProperties = Scala.javaMap(spec.properties());
 
-        switch (bridge.catalogType()) {
-            case INTERNAL:
-                return nativeTable(name, ifNotExists, schema, query, comment, userProperties, clauses, renderer);
-            case ICEBERG: {
-                String provider = Scala.orNull(spec.provider());
-                if (provider != null && !ICEBERG.equalsIgnoreCase(provider)) {
-                    throw new SparkDialectException("USING " + provider + " is not supported for Iceberg tables");
-                }
-                if (spec.serde().isDefined() || !spec.options().isEmpty()) {
-                    throw new SparkDialectException("STORED AS, ROW FORMAT and OPTIONS are not supported for "
-                            + "Iceberg tables");
-                }
-                Map<String, String> properties = new LinkedHashMap<>();
-                if (spec.location().isDefined()) {
-                    properties.put("location", spec.location().get());
-                }
-                properties.putAll(userProperties);
-                List<String> partitions = new ArrayList<>();
-                for (Transform transform : partitioning) {
-                    partitions.add(icebergTransform(transform));
-                }
-                return ddl(name, ifNotExists, schema, query, comment, partitions, properties, renderer);
-            }
-            default:
-                // Spark has no v2 Hive catalog; it only creates Hive tables through spark_catalog.
-                throw new SparkDialectException("Spark creates " + bridge.catalogType() + " tables only through "
-                        + "spark_catalog; map StarRocks catalog " + bridge.catalogName() + " to spark_catalog");
+        if (format == Format.NATIVE) {
+            return nativeTable(name, ifNotExists, schema, query, comment, Scala.javaMap(spec.properties()),
+                    StorageClauses.of(parsed), renderer);
+        } else if (format == Format.HIVE) {
+            return createHiveTable(bridge, ident, parsed, query, ifNotExists, renderer);
         }
+        checkWritable(format, query);
+        if (spec.serde().isDefined() || !spec.options().isEmpty()) {
+            throw new SparkDialectException("STORED AS, ROW FORMAT and OPTIONS are not supported for "
+                    + format.engine() + " tables");
+        }
+        Map<String, String> properties = new LinkedHashMap<>();
+        if (spec.location().isDefined()) {
+            if (format == Format.PAIMON) {
+                throw new SparkDialectException("LOCATION is not supported for Paimon tables");
+            }
+            properties.put("location", spec.location().get());
+        }
+        properties.putAll(Scala.javaMap(spec.properties()));
+        List<String> partitions = new ArrayList<>();
+        for (Transform transform : partitioning) {
+            partitions.add(format == Format.ICEBERG ? icebergTransform(transform) : identityColumn(transform));
+        }
+        return ddl(name, ifNotExists, schema, query, comment, engine, partitions, properties, renderer);
+    }
+
+    /**
+     * A Hive table outside spark_catalog. Spark only creates Hive tables in spark_catalog, with its Hive rules
+     * (storage defaults, partition columns moved last), so apply exactly those: analyze the CREATE TABLE again with
+     * the target catalog standing in for spark_catalog. The query is already analyzed against the session's
+     * catalogs, so the tables it reads stay where they are.
+     */
+    private Translation createHiveTable(SparkCatalogBridge bridge, Identifier ident, LogicalPlan parsed,
+                                        LogicalPlan query, boolean ifNotExists, PlanRenderer renderer) {
+        String db = ident.namespace()[0];
+        LogicalPlan name = new UnresolvedIdentifier(Scala.seq(List.of(db, ident.name())), false);
+        LogicalPlan statement;
+        if (parsed instanceof CreateTableAsSelect ctas) {
+            statement = new CreateTableAsSelect(name, ctas.partitioning(), query, ctas.tableSpec(),
+                    ctas.writeOptions(), ifNotExists, false);
+        } else {
+            org.apache.spark.sql.catalyst.plans.logical.CreateTable create =
+                    (org.apache.spark.sql.catalyst.plans.logical.CreateTable) parsed;
+            statement = new org.apache.spark.sql.catalyst.plans.logical.CreateTable(name, create.tableSchema(),
+                    create.partitioning(), create.tableSpec(), ifNotExists);
+        }
+        SparkCatalogs hiveCatalog = new SparkCatalogs() {
+            @Override
+            public SparkCatalogBridge sessionCatalog() {
+                return bridge;
+            }
+
+            @Override
+            public SparkCatalogBridge catalog(String sparkName) {
+                return null;
+            }
+
+            @Override
+            public String currentCatalog() {
+                return SESSION_CATALOG;
+            }
+
+            @Override
+            public String currentDatabase() {
+                return db;
+            }
+        };
+        LogicalPlan analyzed = analyze(new SessionlessAnalyzer(hiveCatalog, analyzer.conf()), statement);
+        return createSessionCatalogTable((CreateTable) analyzed, bridge, StorageClauses.of(parsed), renderer);
+    }
+
+    /** CTAS needs a catalog StarRocks can write to. */
+    private static void checkWritable(Format format, LogicalPlan query) {
+        if (format == Format.PAIMON && query != null) {
+            throw new SparkDialectException("StarRocks cannot write Paimon tables; create the table without AS SELECT");
+        }
+    }
+
+    private static String identityColumn(Transform transform) {
+        if (!transform.name().equalsIgnoreCase("identity") || transform.references().length != 1
+                || transform.references()[0].fieldNames().length != 1) {
+            throw new SparkDialectException("Only partitioning by columns is supported here: " + transform.describe());
+        }
+        return Sql.quote(transform.references()[0].fieldNames()[0]);
     }
 
     /**
@@ -355,12 +485,12 @@ public final class SparkSqlTranslator {
             throw new SparkDialectException(String.join(", ", clauses.present()) + " cannot be used for StarRocks "
                     + "native tables: Spark storage options have no StarRocks equivalent");
         }
-        return ddl(name, ifNotExists, schema, query, comment, List.of(), properties, renderer);
+        return ddl(name, ifNotExists, schema, query, comment, null, List.of(), properties, renderer);
     }
 
     private static Translation ddl(String name, boolean ifNotExists, StructType schema, LogicalPlan query,
-                                   String comment, List<String> partitions, Map<String, String> properties,
-                                   PlanRenderer renderer) {
+                                   String comment, String engine, List<String> partitions,
+                                   Map<String, String> properties, PlanRenderer renderer) {
         StringBuilder sql = new StringBuilder("CREATE TABLE ");
         if (ifNotExists) {
             sql.append("IF NOT EXISTS ");
@@ -376,6 +506,9 @@ public final class SparkSqlTranslator {
                 columns.add(column);
             }
             sql.append(columns);
+        }
+        if (engine != null) {
+            sql.append(" ENGINE = ").append(engine);
         }
         if (comment != null) {
             sql.append(" COMMENT ").append(Sql.string(comment));
