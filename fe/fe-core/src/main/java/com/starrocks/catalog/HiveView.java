@@ -67,7 +67,7 @@ public class HiveView extends ConnectorView {
     public QueryStatement doGetQueryStatement(SessionVariable sessionVariable) throws StarRocksPlannerException {
         if (viewType == Type.Spark) {
             // Whatever the session dialect, a Spark view means what it means in Spark.
-            return SparkParserUtils.parseView(catalogName, dbName, name, sessionVariable);
+            return SparkParserUtils.parseView(catalogName, dbName, name, true, sessionVariable);
         }
         if (viewType == HiveView.Type.Trino) {
             sessionVariable.setSqlDialect("trino");

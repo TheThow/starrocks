@@ -63,7 +63,7 @@ public class IcebergView extends ConnectorView {
     @Override
     protected QueryStatement doGetQueryStatement(SessionVariable sessionVariable) {
         if (isSparkDialect()) {
-            return SparkParserUtils.parseView(catalogName, dbName, name, sessionVariable);
+            return SparkParserUtils.parseView(catalogName, dbName, name, false, sessionVariable);
         }
         return super.doGetQueryStatement(sessionVariable);
     }

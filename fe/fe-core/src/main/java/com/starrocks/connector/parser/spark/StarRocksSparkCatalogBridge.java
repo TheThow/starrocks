@@ -34,7 +34,7 @@ import java.util.Map;
 import java.util.StringJoiner;
 
 /**
- * Exposes one StarRocks catalog to the Spark analyzer as Spark's session catalog.
+ * Exposes one StarRocks catalog to the Spark analyzer (see {@link StarRocksSparkCatalogs} for its Spark name).
  * All lookups go through {@link MetadataMgr}, so they use StarRocks' metadata caches and the session's identity;
  * privileges are still checked by StarRocks when it analyzes the translated SQL.
  */
@@ -44,13 +44,11 @@ public class StarRocksSparkCatalogBridge implements SparkCatalogBridge {
 
     private final ConnectContext context;
     private final String catalogName;
-    private final String currentDatabase;
     private final MetadataMgr metadataMgr = GlobalStateMgr.getCurrentState().getMetadataMgr();
 
-    public StarRocksSparkCatalogBridge(ConnectContext context, String catalogName, String currentDatabase) {
+    public StarRocksSparkCatalogBridge(ConnectContext context, String catalogName) {
         this.context = context;
         this.catalogName = catalogName;
-        this.currentDatabase = currentDatabase;
     }
 
     @Override
@@ -61,11 +59,6 @@ public class StarRocksSparkCatalogBridge implements SparkCatalogBridge {
     @Override
     public String catalogType() {
         return GlobalStateMgr.getCurrentState().getCatalogMgr().getCatalogType(catalogName);
-    }
-
-    @Override
-    public String currentDatabase() {
-        return currentDatabase;
     }
 
     @Override
@@ -107,8 +100,8 @@ public class StarRocksSparkCatalogBridge implements SparkCatalogBridge {
                     .setProvider(properties.getOrDefault(SPARK_PROVIDER_PROPERTY, "hive"))
                     .setLocation(hiveTable.getTableLocation())
                     .putProperties(properties);
-        } else if (table instanceof IcebergTable) {
-            info.setProvider("iceberg");
+        } else if (table instanceof IcebergTable icebergTable) {
+            info.setProvider("iceberg").setPartitionSourceColumns(icebergTable.getPartitionColumnNames());
         }
         return info;
     }
@@ -140,16 +133,14 @@ public class StarRocksSparkCatalogBridge implements SparkCatalogBridge {
         String text = "SELECT * FROM (" + view.getInlineViewDef() + ") AS __iceberg_view(" + aliases + ")";
 
         Map<String, String> properties = new HashMap<>();
-        String defaultDb = view.getDefaultDbName() != null ? view.getDefaultDbName() : db;
-        properties.put("view.catalogAndNamespace.numParts", "2");
-        properties.put("view.catalogAndNamespace.part.0", "spark_catalog");
-        properties.put("view.catalogAndNamespace.part.1", defaultDb);
         properties.put("view.query.out.numCols", Integer.toString(columns.size()));
         for (int i = 0; i < columns.size(); i++) {
             properties.put("view.query.out.col." + i, columns.get(i).getName());
         }
 
-        SparkTableInfo info = SparkTableInfo.view(db, view.getName(), text);
+        // Unqualified names resolve in the view's default namespace of the catalog the view is read from.
+        SparkTableInfo info = SparkTableInfo.view(db, view.getName(), text)
+                .setViewDefaultNamespace(view.getDefaultDbName() != null ? view.getDefaultDbName() : db);
         addColumns(info, columns);
         return info.putProperties(properties).setComment(view.getComment());
     }

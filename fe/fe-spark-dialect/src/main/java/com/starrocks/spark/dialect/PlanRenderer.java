@@ -49,6 +49,9 @@ import org.apache.spark.sql.catalyst.plans.logical.Union;
 import org.apache.spark.sql.catalyst.plans.logical.View;
 import org.apache.spark.sql.catalyst.plans.logical.Window;
 import org.apache.spark.sql.catalyst.plans.logical.WithCTE;
+import org.apache.spark.sql.connector.catalog.CatalogPlugin;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
 import org.apache.spark.sql.types.ArrayType;
 
 import java.util.ArrayDeque;
@@ -103,7 +106,8 @@ final class PlanRenderer {
         }
     }
 
-    private final String catalog;
+    // StarRocks catalog behind spark_catalog; tables of other catalogs carry their own.
+    private final String sessionCatalog;
     private final ExpressionRenderer expressions;
     private final Deque<Map<Long, String>> outerScopes = new ArrayDeque<>();
     private final Map<Long, String> cteNames = new HashMap<>();
@@ -112,8 +116,8 @@ final class PlanRenderer {
     private final LinkedHashMap<Long, String> cteDefinitions = new LinkedHashMap<>();
     private int aliasCounter;
 
-    PlanRenderer(String catalog, ExpressionRenderer.Context context) {
-        this.catalog = catalog;
+    PlanRenderer(String sessionCatalog, ExpressionRenderer.Context context) {
+        this.sessionCatalog = sessionCatalog;
         this.expressions = new ExpressionRenderer(this, context);
     }
 
@@ -202,7 +206,13 @@ final class PlanRenderer {
             // Distribution only; does not change the result.
             return visit(plan.children().head());
         } else if (plan instanceof HiveTableRelation relation) {
-            return visitTable(relation);
+            CatalogTable table = relation.tableMeta();
+            return visitTable(qualifiedName(sessionCatalog, table.identifier().database().get(),
+                    table.identifier().table()), Scala.list(relation.output()));
+        } else if (plan instanceof DataSourceV2Relation relation) {
+            Identifier identifier = relation.identifier().get();
+            return visitTable(qualifiedName(starRocksCatalog(relation.catalog().get()),
+                    identifier.namespace()[0], identifier.name()), Scala.list(relation.output()));
         } else if (plan instanceof OneRowRelation) {
             Block block = new Block();
             block.output = new ArrayList<>();
@@ -253,14 +263,24 @@ final class PlanRenderer {
         throw new SparkDialectException("Unsupported Spark plan node: " + plan.nodeName());
     }
 
-    private Block visitTable(HiveTableRelation relation) {
-        CatalogTable table = relation.tableMeta();
+    /** StarRocks catalog of a table in a non-session Spark catalog. */
+    static String starRocksCatalog(CatalogPlugin plugin) {
+        if (plugin instanceof BridgeTableCatalog tables) {
+            return tables.bridge().catalogName();
+        }
+        throw new SparkDialectException("Spark catalog " + plugin.name() + " is not backed by StarRocks");
+    }
+
+    static String qualifiedName(String catalog, String db, String table) {
+        return Sql.quote(catalog) + "." + Sql.quote(db) + "." + Sql.quote(table);
+    }
+
+    private Block visitTable(String qualifiedName, List<Attribute> output) {
         String alias = nextAlias();
         Block block = new Block();
-        block.from = Sql.quote(catalog) + "." + Sql.quote(table.identifier().database().get()) + "."
-                + Sql.quote(table.identifier().table()) + " " + alias;
+        block.from = qualifiedName + " " + alias;
         block.singleRelation = true;
-        block.output = Scala.list(relation.output());
+        block.output = output;
         for (Attribute attribute : block.output) {
             block.inputCols.put(attribute.exprId().id(), alias + "." + Sql.quote(attribute.name()));
         }

@@ -39,12 +39,18 @@ public final class SparkTableInfo {
     // Data columns followed by partition columns, the order Spark's CatalogTable expects.
     private final List<Column> columns = new ArrayList<>();
     private final List<String> partitionColumns = new ArrayList<>();
+    // Columns read by partition transforms of tables that are not Hive-style partitioned (e.g. Iceberg). Spark
+    // only sees them through its v2 catalog API, which does not move them to the end of the schema.
+    private final List<String> partitionSourceColumns = new ArrayList<>();
     // Spark provider, e.g. "hive", "parquet", "iceberg".
     private String provider;
     private String location;
     private String comment;
     // View SQL in Spark syntax.
     private String viewText;
+    // Namespace unqualified names in the view resolve in, for views that do not record their Spark catalog and
+    // namespace in view.catalogAndNamespace.* (e.g. Iceberg views). The catalog is the one the view is read from.
+    private String viewDefaultNamespace;
     // Raw table properties. For views created by Spark these carry view.sqlConfig.*, view.catalogAndNamespace.*
     // and view.query.out.*, which Spark uses to analyze the view exactly as it was created.
     private final Map<String, String> properties = new HashMap<>();
@@ -76,6 +82,12 @@ public final class SparkTableInfo {
         return this;
     }
 
+    public SparkTableInfo setPartitionSourceColumns(List<String> names) {
+        partitionSourceColumns.clear();
+        partitionSourceColumns.addAll(names);
+        return this;
+    }
+
     public SparkTableInfo setProvider(String provider) {
         this.provider = provider;
         return this;
@@ -88,6 +100,11 @@ public final class SparkTableInfo {
 
     public SparkTableInfo setComment(String comment) {
         this.comment = comment;
+        return this;
+    }
+
+    public SparkTableInfo setViewDefaultNamespace(String namespace) {
+        this.viewDefaultNamespace = namespace;
         return this;
     }
 
@@ -118,6 +135,10 @@ public final class SparkTableInfo {
         return partitionColumns;
     }
 
+    public List<String> getPartitionSourceColumns() {
+        return partitionSourceColumns;
+    }
+
     public String getProvider() {
         return provider;
     }
@@ -132,6 +153,10 @@ public final class SparkTableInfo {
 
     public String getViewText() {
         return viewText;
+    }
+
+    public String getViewDefaultNamespace() {
+        return viewDefaultNamespace;
     }
 
     public Map<String, String> getProperties() {

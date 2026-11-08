@@ -17,6 +17,7 @@ package com.starrocks.connector.parser.spark;
 import com.google.common.base.Strings;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.spark.dialect.SparkCatalogs;
 import com.starrocks.spark.dialect.SparkSqlTranslator;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.StatementBase;
@@ -43,21 +44,28 @@ public final class SparkParserUtils {
     public static SparkSqlTranslator.Translation translate(String sparkSql, SessionVariable sessionVariable) {
         ConnectContext context = requireContext();
         SparkSqlTranslator translator = new SparkSqlTranslator(
-                new StarRocksSparkCatalogBridge(context, context.getCurrentCatalog(), context.getDatabase()),
+                StarRocksSparkCatalogs.forSession(context, sessionVariable),
                 sessionVariable.getTimeZone(), sparkConf(sessionVariable));
         SparkSqlTranslator.Translation translation = translator.translate(sparkSql);
         LOG.debug("Spark SQL [{}] translated to [{}]", sparkSql, translation.sql());
         return translation;
     }
 
-    /** The StarRocks query for a view defined in Spark SQL, analyzed with the view's own Spark settings. */
-    public static QueryStatement parseView(String catalogName, String dbName, String viewName,
+    /**
+     * The StarRocks query for a view defined in Spark SQL, analyzed with the view's own Spark settings.
+     *
+     * @param hiveView whether the view is stored in a Hive metastore, which makes its catalog spark_catalog
+     */
+    public static QueryStatement parseView(String catalogName, String dbName, String viewName, boolean hiveView,
                                            SessionVariable sessionVariable) {
         ConnectContext context = requireContext();
-        SparkSqlTranslator translator = new SparkSqlTranslator(
-                new StarRocksSparkCatalogBridge(context, catalogName, dbName),
-                sessionVariable.getTimeZone(), sparkConf(sessionVariable));
-        String sql = translator.translateView(dbName, viewName);
+        StarRocksSparkCatalogs catalogs = StarRocksSparkCatalogs.forView(context, sessionVariable, catalogName,
+                hiveView);
+        SparkSqlTranslator translator = new SparkSqlTranslator(catalogs, sessionVariable.getTimeZone(),
+                sparkConf(sessionVariable));
+        String sparkCatalog = catalogs.sparkName(catalogName);
+        String sql = translator.translateView(
+                SparkCatalogs.SESSION_CATALOG.equals(sparkCatalog) ? null : sparkCatalog, dbName, viewName);
         LOG.debug("Spark view {}.{}.{} translated to [{}]", catalogName, dbName, viewName, sql);
         StatementBase statement = SqlParser.parseOneWithStarRocksDialect(sql, sessionVariable);
         if (!(statement instanceof QueryStatement queryStatement)) {

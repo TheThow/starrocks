@@ -29,6 +29,7 @@ import org.apache.spark.sql.catalyst.plans.logical.InsertIntoStatement;
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
 import org.apache.spark.sql.catalyst.rules.Rule;
 import org.apache.spark.sql.connector.catalog.CatalogManager;
+import org.apache.spark.sql.connector.catalog.CatalogPlugin;
 import org.apache.spark.sql.execution.SparkSqlParser;
 import org.apache.spark.sql.execution.datasources.ApplyCharTypePadding$;
 import org.apache.spark.sql.execution.datasources.CreateTable;
@@ -42,7 +43,12 @@ import scala.Function1;
 import scala.collection.Seq;
 import scala.runtime.BoxedUnit;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * Spark's analyzer assembled without a SparkSession or SparkContext.
@@ -55,8 +61,14 @@ import java.util.List;
  *   <li>DataSourceAnalysis, HiveOnlyCheck: plan execution commands, which we never run.</li>
  *   <li>QualifyLocationWithWarehouse: rewrites LOCATION against Spark's warehouse dir, which does not exist here.</li>
  * </ul>
- * Everything that decides result types (type coercion, decimal precision, ANSI mode, function resolution,
- * view expansion with each view's stored SQL configs) is Catalyst's own code and runs unchanged.
+ * Added: {@link ResolveCatalogViews}, for views in catalogs other than spark_catalog.
+ *
+ * <p>StarRocks catalogs other than the one behind spark_catalog are served by a CatalogManager that returns a
+ * {@link BridgeTableCatalog} per Spark catalog name, as Spark would load a catalog from spark.sql.catalog.*.
+ *
+ * <p>Everything that decides result types (type coercion, decimal precision, ANSI mode, function resolution,
+ * view expansion with each view's stored SQL configs, INSERT column alignment) is Catalyst's own code and runs
+ * unchanged.
  *
  * <p>Re-check this list against {@code BaseSessionStateBuilder} on every Spark upgrade.
  */
@@ -66,9 +78,9 @@ final class SessionlessAnalyzer {
     private final SessionCatalog sessionCatalog;
     private final Analyzer analyzer;
 
-    SessionlessAnalyzer(SparkCatalogBridge bridge, SQLConf conf) {
+    SessionlessAnalyzer(SparkCatalogs catalogs, SQLConf conf) {
         this.conf = conf;
-        ExternalCatalog externalCatalog = new BridgeExternalCatalog(bridge);
+        ExternalCatalog externalCatalog = new BridgeExternalCatalog(catalogs.sessionCatalog());
         this.sessionCatalog = new SessionCatalog(
                 Scala.fn0(() -> externalCatalog),
                 Scala.fn0(() -> new GlobalTempViewManager("global_temp")),
@@ -81,16 +93,53 @@ final class SessionlessAnalyzer {
                 1000,
                 -1L,
                 "default");
-        CatalogManager catalogManager = new CatalogManager(new V2SessionCatalog(sessionCatalog), sessionCatalog);
-        String currentDb = bridge.currentDatabase();
-        if (currentDb != null && bridge.databaseExists(currentDb)) {
-            withConf(() -> {
+        CatalogPlugin sessionPlugin = new V2SessionCatalog(sessionCatalog);
+        Map<String, Optional<CatalogPlugin>> plugins = new HashMap<>();
+        // Spark finds catalogs by name through the CatalogManager (normally from spark.sql.catalog.* settings).
+        // Names that map to the session catalog's StarRocks catalog return spark_catalog itself, so they keep
+        // the session catalog's (v1) semantics.
+        Function<String, CatalogPlugin> otherCatalog = name -> plugins.computeIfAbsent(
+                name.toLowerCase(Locale.ROOT), key -> {
+                    SparkCatalogBridge bridge = catalogs.catalog(name);
+                    if (bridge == null) {
+                        return Optional.empty();
+                    }
+                    if (bridge.catalogName().equals(catalogs.sessionCatalog().catalogName())) {
+                        return Optional.of(sessionPlugin);
+                    }
+                    return Optional.of(new BridgeTableCatalog(name, bridge));
+                }).orElse(null);
+        CatalogManager catalogManager = new CatalogManager(sessionPlugin, sessionCatalog) {
+            @Override
+            public synchronized CatalogPlugin catalog(String name) {
+                if (!name.equalsIgnoreCase(SparkCatalogs.SESSION_CATALOG)) {
+                    CatalogPlugin plugin = otherCatalog.apply(name);
+                    if (plugin != null) {
+                        return plugin;
+                    }
+                }
+                return super.catalog(name);
+            }
+
+            @Override
+            public boolean isCatalogRegistered(String name) {
+                return otherCatalog.apply(name) != null || super.isCatalogRegistered(name);
+            }
+        };
+        withConf(() -> {
+            String currentCatalog = catalogs.currentCatalog();
+            if (currentCatalog != null && !currentCatalog.equalsIgnoreCase(SparkCatalogs.SESSION_CATALOG)) {
+                catalogManager.setCurrentCatalog(currentCatalog);
+            }
+            String currentDb = catalogs.currentDatabase();
+            if (currentDb != null) {
                 catalogManager.setCurrentNamespace(new String[] {currentDb});
-                return null;
-            });
-        }
+            }
+            return null;
+        });
 
         List<Rule<LogicalPlan>> resolutionRules = List.of(
+                new ResolveCatalogViews(sessionCatalog, catalogManager, this::analyzer),
                 new ResolveCatalogRelations(),
                 new ResolveSessionCatalog(catalogManager));
         List<Rule<LogicalPlan>> postHocRules = List.of(
@@ -122,6 +171,10 @@ final class SessionlessAnalyzer {
 
     SQLConf conf() {
         return conf;
+    }
+
+    private Analyzer analyzer() {
+        return analyzer;
     }
 
     LogicalPlan parse(String sql) {

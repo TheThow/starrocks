@@ -46,6 +46,8 @@ final class BridgeExternalCatalog extends InMemoryCatalog {
     // Spark keeps the schema and provider of its own data source tables in these table properties.
     // HiveExternalCatalog strips them when restoring a table, so do the same.
     private static final String SPARK_SOURCES_PREFIX = "spark.sql.sources.";
+    private static final String VIEW_NUM_PARTS = "view.catalogAndNamespace.numParts";
+    private static final String VIEW_PART_PREFIX = "view.catalogAndNamespace.part.";
 
     private final SparkCatalogBridge bridge;
     private final Map<String, CatalogTable> tables = new HashMap<>();
@@ -55,14 +57,18 @@ final class BridgeExternalCatalog extends InMemoryCatalog {
         this.bridge = bridge;
     }
 
+    // Spark resets the session catalog to its default database whenever the current catalog changes, so that
+    // database has to exist even if the StarRocks catalog has none of that name. It is empty then.
+    private static final String DEFAULT_DATABASE = "default";
+
     @Override
     public synchronized boolean databaseExists(String db) {
-        return bridge.databaseExists(db);
+        return bridge.databaseExists(db) || DEFAULT_DATABASE.equals(db);
     }
 
     @Override
     public synchronized CatalogDatabase getDatabase(String db) {
-        if (!bridge.databaseExists(db)) {
+        if (!databaseExists(db)) {
             throw Scala.sneakyThrow(new NoSuchDatabaseException(db));
         }
         return new CatalogDatabase(db, "", URI.create("starrocks:/" + bridge.catalogName() + "/" + db),
@@ -121,12 +127,13 @@ final class BridgeExternalCatalog extends InMemoryCatalog {
             return tables.get(key);
         }
         SparkTableInfo info = bridge.getTable(db, table);
-        CatalogTable catalogTable = info == null ? null : toCatalogTable(info);
+        CatalogTable catalogTable = info == null ? null : toCatalogTable(info, SparkCatalogs.SESSION_CATALOG);
         tables.put(key, catalogTable);
         return catalogTable;
     }
 
-    private static CatalogTable toCatalogTable(SparkTableInfo info) {
+    /** Spark's catalog entry for a table or view of the catalog Spark knows as {@code sparkCatalog}. */
+    static CatalogTable toCatalogTable(SparkTableInfo info, String sparkCatalog) {
         List<StructField> fields = new ArrayList<>();
         for (SparkTableInfo.Column column : info.getColumns()) {
             DataType type = CatalystSqlParser$.MODULE$.parseDataType(column.sparkType());
@@ -144,6 +151,9 @@ final class BridgeExternalCatalog extends InMemoryCatalog {
                 properties.put(k, v);
             }
         });
+        if (info.isView()) {
+            setViewCatalogAndNamespace(info, sparkCatalog, properties);
+        }
 
         CatalogStorageFormat storage = new CatalogStorageFormat(
                 Scala.option(info.getLocation() == null ? null : URI.create(info.getLocation())),
@@ -151,7 +161,7 @@ final class BridgeExternalCatalog extends InMemoryCatalog {
 
         String provider = info.isView() ? null : (info.getProvider() == null ? "hive" : info.getProvider());
         return new CatalogTable(
-                new TableIdentifier(info.getName(), Scala.option(info.getDatabase())),
+                new TableIdentifier(info.getName(), Scala.option(info.getDatabase()), Scala.option(sparkCatalog)),
                 info.isView() ? CatalogTableType.VIEW() : CatalogTableType.EXTERNAL(),
                 storage,
                 new StructType(fields.toArray(new StructField[0])),
@@ -171,5 +181,24 @@ final class BridgeExternalCatalog extends InMemoryCatalog {
                 true,
                 Scala.map(new HashMap<>()),
                 Scala.option(info.getViewText()));
+    }
+
+    /**
+     * Spark resolves the names in a view relative to view.catalogAndNamespace.*. Views that do not record it get
+     * the catalog they are read from. A view recorded in spark_catalog but read through another catalog name
+     * refers to the catalog that stores it, which is that other catalog here.
+     */
+    private static void setViewCatalogAndNamespace(SparkTableInfo info, String sparkCatalog,
+                                                   Map<String, String> properties) {
+        if (!properties.containsKey(VIEW_NUM_PARTS)) {
+            if (info.getViewDefaultNamespace() != null) {
+                properties.put(VIEW_NUM_PARTS, "2");
+                properties.put(VIEW_PART_PREFIX + "0", sparkCatalog);
+                properties.put(VIEW_PART_PREFIX + "1", info.getViewDefaultNamespace());
+            }
+        } else if (!SparkCatalogs.SESSION_CATALOG.equalsIgnoreCase(sparkCatalog)
+                && SparkCatalogs.SESSION_CATALOG.equalsIgnoreCase(properties.get(VIEW_PART_PREFIX + "0"))) {
+            properties.put(VIEW_PART_PREFIX + "0", sparkCatalog);
+        }
     }
 }

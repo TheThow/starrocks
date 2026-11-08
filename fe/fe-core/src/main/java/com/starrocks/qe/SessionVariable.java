@@ -1037,6 +1037,10 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     // Spark SQL settings for sql_dialect = 'spark', as "key=value;key=value", e.g. "spark.sql.ansi.enabled=true"
     public static final String SPARK_SQL_CONF = "spark_sql_conf";
 
+    // Spark catalog names of StarRocks catalogs for sql_dialect = 'spark', as "spark_name=starrocks_catalog;...",
+    // e.g. "spark_catalog=hive_prod;iceberg_prod=iceberg". Default: spark_catalog is the current catalog.
+    public static final String SPARK_CATALOG_MAPPING = "spark_catalog_mapping";
+
     public static final String ENABLE_OUTER_JOIN_REORDER = "enable_outer_join_reorder";
 
     public static final String CBO_REORDER_THRESHOLD_USE_EXHAUSTIVE = "cbo_reorder_threshold_use_exhaustive";
@@ -3301,6 +3305,9 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     @VarAttr(name = SPARK_SQL_CONF)
     private String sparkSqlConf = "";
+
+    @VarAttr(name = SPARK_CATALOG_MAPPING)
+    private String sparkCatalogMapping = "";
 
     @VarAttr(name = ENABLE_OUTER_JOIN_REORDER)
     private boolean enableOuterJoinReorder = true;
@@ -6148,6 +6155,14 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public void setSparkSqlConf(String sparkSqlConf) {
         this.sparkSqlConf = sparkSqlConf;
+    }
+
+    public String getSparkCatalogMapping() {
+        return sparkCatalogMapping;
+    }
+
+    public void setSparkCatalogMapping(String sparkCatalogMapping) {
+        this.sparkCatalogMapping = sparkCatalogMapping;
     }
 
     public boolean isEnableOuterJoinReorder() {

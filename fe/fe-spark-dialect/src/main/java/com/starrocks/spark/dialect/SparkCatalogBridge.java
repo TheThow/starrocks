@@ -17,9 +17,9 @@ package com.starrocks.spark.dialect;
 import java.util.List;
 
 /**
- * Metadata the Spark analyzer resolves names against. One bridge maps one StarRocks catalog onto Spark's
- * session catalog ({@code spark_catalog}): Spark's {@code db.tbl} names are looked up in that StarRocks catalog,
- * and generated StarRocks SQL qualifies every table with {@link #catalogName()}.
+ * Metadata of one StarRocks catalog, as the Spark analyzer resolves names against it. Generated StarRocks SQL
+ * qualifies every table of this catalog with {@link #catalogName()}. See {@link SparkCatalogs} for how bridges
+ * get their Spark catalog names.
  */
 public interface SparkCatalogBridge {
 
@@ -28,9 +28,6 @@ public interface SparkCatalogBridge {
 
     /** Connector type of the catalog, e.g. "hive", "iceberg" or "internal". Drives DDL property mapping. */
     String catalogType();
-
-    /** Current database of the StarRocks session, or null if none is selected. */
-    String currentDatabase();
 
     boolean databaseExists(String db);
 
